@@ -16,7 +16,7 @@
   #overlay.hidden { display: none; }
   #overlay h1 { margin: 0 0 8px; font-size: clamp(28px, 7vw, 56px); letter-spacing: 2px; }
   #overlay p { margin: 4px 0; font-size: clamp(12px, 3.2vw, 16px); color: #bbb; max-width: 560px; line-height: 1.4; }
-  #overlay button { margin-top: 18px; font-size: 22px; font-weight: 700; padding: 14px 44px; border: 0; border-radius: 10px;
+  #overlay button { margin: 18px 6px 0; font-size: 22px; font-weight: 700; padding: 14px 44px; border: 0; border-radius: 10px;
                     background: #3a8dff; color: #fff; letter-spacing: 1px; }
   #overlay button:active { transform: scale(0.97); }
 </style>
@@ -31,7 +31,10 @@
     <b>Double-tap &amp; hold</b> = BLOCK<br>
     <span style="color:#888">Keyboard: WASD move · J jab · K hook · L kick · Space block · ` debug</span>
   </p>
-  <button id="ovBtn">START</button>
+  <div>
+    <button id="ovBtn">FIGHT</button>
+    <button id="ovPractice" style="background:#555">PRACTICE</button>
+  </div>
 </div>
 <script>
 (() => {
@@ -45,6 +48,16 @@ const MOVE_SPEED = 3.0;
 const MAX_HP = 100, MAX_ST = 100;
 const ST_REGEN = 22, ST_REGEN_BLOCK = 6, ST_REGEN_DELAY = 0.45;
 const BLOCK_MULT = 0.15;    // damage taken while blocking
+
+// CPU difficulty: all the knobs in one place (lower = easier)
+const AI = {
+  thinkMin: 0.9, thinkMax: 1.6, // seconds between attack decisions
+  attackChance: 0.75,           // scales how often it throws when a decision comes up
+  blockChance: 0.1,             // chance to block when it sees your wind-up
+  extraStartup: 0.15,           // added wind-up on its attacks, so you can react to the red cone
+  damageMult: 0.6,              // its hits do 60% damage
+  speedMult: 0.75,              // it moves slower than you
+};
 
 // range = reach from attacker's center to the target's body edge
 const ATTACKS = {
@@ -76,7 +89,7 @@ const rand = (a, b) => a + Math.random() * (b - a);
 const now = () => performance.now() / 1000;
 
 // ---------------------------------------------------------------- state
-let player, cpu, ai, running = false, over = false, overTimer = 0;
+let player, cpu, ai, practice = false, running = false, over = false, overTimer = 0;
 let hitstop = 0, shake = 0, time = 0;
 let particles = [], floaters = [];
 let banner = { text: '', t: 0, color: '#fff' };
@@ -97,7 +110,7 @@ function makeFighter(x, y, face, isPlayer) {
 function reset() {
   player = makeFighter(-2.5, 0, 0, true);
   cpu = makeFighter(2.5, 0, Math.PI, false);
-  ai = { decide: 0.8, strafe: 1, strafeT: 0, pref: 2.0, prefT: 0, retreat: false, blockT: 0, reactedTo: -1 };
+  ai = { decide: 1.5, strafe: 1, strafeT: 0, pref: 2.0, prefT: 0, retreat: false, blockT: 0, reactedTo: -1 };
   particles = []; floaters = [];
   hitstop = 0; shake = 0; over = false; overTimer = 0;
   lastGesture = '-';
@@ -111,7 +124,7 @@ function tryStartAttack(f, key) {
   if (f.state !== 'idle') { f.buffer = { key, t: time }; return false; }
   if (f.st < a.stam) { if (f.isPlayer) say('NO STAMINA', '#ffd23a'); return false; }
   f.st -= a.stam;
-  f.atk = a; f.atkId = ++atkCounter; f.state = 'startup'; f.t = a.startup;
+  f.atk = a; f.atkId = ++atkCounter; f.state = 'startup'; f.t = f.startupT = a.startup + (f.isPlayer ? 0 : AI.extraStartup);
   f.hitDone = false; f.missed = false; f.regenDelay = ST_REGEN_DELAY; f.buffer = null;
   return true;
 }
@@ -127,14 +140,14 @@ function resolveHit(a, b) {
   const blocked = b.state === 'block' && facingAttacker;
   const hx = b.x - nx * R, hy = b.y - ny * R;
   if (blocked) {
-    const dmg = atk.dmg * BLOCK_MULT;
+    const dmg = atk.dmg * BLOCK_MULT * (a.isPlayer ? 1 : AI.damageMult);
     b.hp -= dmg; b.st = Math.max(0, b.st - atk.dmg * 0.6);
     b.kx += nx * 2.0; b.ky += ny * 2.0;
     burst(hx, hy, '#9fc8ff', 6);
     floater(b.x, b.y, 'BLOCKED', '#9fc8ff');
     hitstop = 0.03; shake = Math.max(shake, 0.05);
   } else {
-    const dmg = atk.dmg;
+    const dmg = Math.round(atk.dmg * (a.isPlayer ? 1 : AI.damageMult));
     b.hp -= dmg;
     b.state = 'hitstun'; b.t = 0.16 + dmg * 0.012; b.atk = null; b.buffer = null;
     b.kx += nx * (2.5 + dmg * 0.25); b.ky += ny * (2.5 + dmg * 0.25);
@@ -201,7 +214,7 @@ function updateFighter(f, opp, mx, my, dt) {
   f.face += clamp(angDiff(want, f.face), -turn, turn);
 
   // movement
-  const sp = MOVE_SPEED * STATE_MOVE[f.state];
+  const sp = MOVE_SPEED * STATE_MOVE[f.state] * (f.isPlayer ? 1 : AI.speedMult);
   const k = Math.min(1, dt * 14);
   f.vx += (mx * sp - f.vx) * k;
   f.vy += (my * sp - f.vy) * k;
@@ -246,7 +259,7 @@ function updateAI(f, p, dt) {
   // react to player's attack wind-up with a block sometimes
   if (p.state === 'startup' && ai.reactedTo !== p.atkId) {
     ai.reactedTo = p.atkId;
-    if (edge < p.atk.range + 0.4 && f.state === 'idle' && Math.random() < 0.3) ai.blockT = rand(0.45, 0.8);
+    if (edge < p.atk.range + 0.4 && f.state === 'idle' && Math.random() < AI.blockChance) ai.blockT = rand(0.45, 0.8);
   }
   ai.blockT = Math.max(0, ai.blockT - dt);
   f.wantBlock = ai.blockT > 0;
@@ -267,14 +280,14 @@ function updateAI(f, p, dt) {
 
   ai.decide -= dt;
   if (ai.decide <= 0 && f.state === 'idle' && !f.wantBlock) {
-    ai.decide = rand(0.3, 0.8);
+    ai.decide = rand(AI.thinkMin, AI.thinkMax);
     const facing = Math.abs(angDiff(Math.atan2(dy, dx), f.face)) < 25 * DEG;
     if (facing) {
       if (ai.retreat) {
-        if (edge <= ATTACKS.jab.range && Math.random() < 0.2) tryStartAttack(f, 'jab');
-      } else if (edge <= ATTACKS.hook.range && Math.random() < 0.4) tryStartAttack(f, 'hook');
-      else if (edge <= ATTACKS.jab.range && Math.random() < 0.45) tryStartAttack(f, 'jab');
-      else if (edge > 1.2 && edge <= ATTACKS.kick.range && Math.random() < 0.3) tryStartAttack(f, 'kick');
+        if (edge <= ATTACKS.jab.range && Math.random() < 0.2 * AI.attackChance) tryStartAttack(f, 'jab');
+      } else if (edge <= ATTACKS.hook.range && Math.random() < 0.4 * AI.attackChance) tryStartAttack(f, 'hook');
+      else if (edge <= ATTACKS.jab.range && Math.random() < 0.45 * AI.attackChance) tryStartAttack(f, 'jab');
+      else if (edge > 1.2 && edge <= ATTACKS.kick.range && Math.random() < 0.3 * AI.attackChance) tryStartAttack(f, 'kick');
     }
   }
   return [mx, my];
@@ -284,14 +297,18 @@ function updateAI(f, p, dt) {
 const input = { joy: null, gest: null, guardPtr: null, lastTapT: -1, lastTapX: 0, lastTapY: 0, keys: {} };
 const trails = []; // fading gesture trails
 
-function dbgBtnRect() { return { x: W / 2 - 28, y: 6, w: 56, h: 26 }; }
+const btnY = () => (W < 600 ? 50 : 6); // below the HUD bars on narrow screens
+function dbgBtnRect() { return { x: W / 2 - 28, y: btnY(), w: 56, h: 26 }; }
+function exitBtnRect() { return { x: W / 2 - 92, y: btnY(), w: 56, h: 26 }; }
+const inRect = (x, y, b) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
 
 cv.addEventListener('pointerdown', e => {
   if (!running) return;
   e.preventDefault();
   const x = e.clientX, y = e.clientY;
   const b = dbgBtnRect();
-  if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { showDebug = !showDebug; return; }
+  if (inRect(x, y, b)) { showDebug = !showDebug; return; }
+  if (practice && inRect(x, y, exitBtnRect())) { showMenu(); return; }
   try { cv.setPointerCapture(e.pointerId); } catch (err) {}
   if (x < W / 2) {
     if (!input.joy) input.joy = { id: e.pointerId, ox: x, oy: y, x, y };
@@ -434,12 +451,17 @@ function step(dt) {
   if (!over) {
     player.wantBlock = input.guardPtr !== null || !!input.keys.Space;
     const [pmx, pmy] = readMove();
-    const [amx, amy] = updateAI(cpu, player, dt);
+    // practice: the opponent is a stationary bag that never attacks
+    const [amx, amy] = practice ? [0, 0] : updateAI(cpu, player, dt);
     updateFighter(player, cpu, pmx, pmy, dt);
     updateFighter(cpu, player, amx, amy, dt);
+    if (practice) {
+      player.st = MAX_ST;
+      if (cpu.hp < 25) { cpu.hp = MAX_HP; floater(cpu.x, cpu.y, 'RESET', '#8f8'); }
+    }
     separate(player, cpu);
     confine(player); confine(cpu);
-    if (player.hp <= 0 || cpu.hp <= 0) {
+    if (!practice && (player.hp <= 0 || cpu.hp <= 0)) {
       over = true; overTimer = 1.1;
       const loser = player.hp <= 0 ? player : cpu;
       loser.state = 'hitstun'; loser.t = 99;
@@ -514,7 +536,7 @@ function render(dt) {
   for (const f of [player, cpu]) {
     ctx.font = 'bold 11px system-ui, sans-serif';
     ctx.fillStyle = f.isPlayer ? '#8fc0ff' : '#ff9a90';
-    ctx.fillText(f.isPlayer ? 'YOU' : 'CPU', sx(f.x), sy(f.y) + cam.scale * 0.8);
+    ctx.fillText(f.isPlayer ? 'YOU' : (practice ? 'BAG' : 'CPU'), sx(f.x), sy(f.y) + cam.scale * 0.8);
   }
 
   drawControls();
@@ -586,7 +608,7 @@ function drawTelegraph(f) {
   const color = f.isPlayer ? f.atk.color : '#ff3b30';
   sector(f, f.atk.range, f.atk.arc);
   ctx.fillStyle = color;
-  ctx.globalAlpha = f.state === 'active' ? 0.35 : 0.12 + 0.1 * (1 - f.t / f.atk.startup);
+  ctx.globalAlpha = f.state === 'active' ? 0.35 : 0.12 + 0.1 * (1 - f.t / f.startupT);
   ctx.fill();
   ctx.globalAlpha = 1;
 }
@@ -614,7 +636,7 @@ function drawFighter(f) {
   const a = f.atk;
   let p = 0; // 0..1 progress through active
   if (a && (f.state === 'startup' || f.state === 'active' || f.state === 'recovery')) {
-    if (f.state === 'startup') p = -(1 - f.t / a.startup);         // wind-up: -1..0
+    if (f.state === 'startup') p = -(1 - f.t / f.startupT);         // wind-up: -1..0
     else if (f.state === 'active') p = 1 - f.t / a.active;          // 0..1
     else p = 1 - clamp(1 - f.t / a.recovery, 0, 1) * 1;             // retract: 1..0
     if (a.key === 'jab') {
@@ -691,7 +713,7 @@ function drawHUD() {
   ctx.textAlign = 'left'; ctx.fillStyle = '#8fc0ff'; ctx.fillText('YOU', pad, pad);
   bar(pad, pad + 16, bw, 14, player.hp, MAX_HP, '#3ddc64', false);
   bar(pad, pad + 33, bw * 0.8, 7, player.st, MAX_ST, '#ffd23a', false);
-  ctx.textAlign = 'right'; ctx.fillStyle = '#ff9a90'; ctx.fillText('CPU', W - pad, pad);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#ff9a90'; ctx.fillText(practice ? 'BAG' : 'CPU', W - pad, pad);
   bar(W - pad - bw, pad + 16, bw, 14, cpu.hp, MAX_HP, '#3ddc64', true);
   bar(W - pad - bw * 0.8, pad + 33, bw * 0.8, 7, cpu.st, MAX_ST, '#ffd23a', true);
 
@@ -702,6 +724,12 @@ function drawHUD() {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#ddd';
   ctx.font = 'bold 11px system-ui, sans-serif';
   ctx.fillText('DEBUG', b.x + b.w / 2, b.y + b.h / 2);
+  if (practice) {
+    const e = exitBtnRect();
+    ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(e.x, e.y, e.w, e.h);
+    ctx.fillStyle = '#ddd'; ctx.fillText('MENU', e.x + e.w / 2, e.y + e.h / 2);
+    ctx.fillStyle = 'rgba(143,255,143,0.7)'; ctx.fillText('PRACTICE · unlimited stamina', W / 2, btnY() + 38);
+  }
 
   // gesture banner
   if (banner.t > 0) {
@@ -777,8 +805,11 @@ const ov = document.getElementById('overlay');
 const ovTitle = document.getElementById('ovTitle');
 const ovText = document.getElementById('ovText');
 const ovBtn = document.getElementById('ovBtn');
+const ovPractice = document.getElementById('ovPractice');
+const menuHTML = ovText.innerHTML;
 
-function startMatch() {
+function startMatch(isPractice) {
+  practice = isPractice;
   reset();
   running = true;
   ov.classList.add('hidden');
@@ -794,7 +825,16 @@ function endMatch() {
   ovBtn.textContent = 'RESTART';
   ov.classList.remove('hidden');
 }
-ovBtn.addEventListener('click', startMatch);
+function showMenu() {
+  running = false;
+  input.joy = null; input.gest = null; input.guardPtr = null;
+  ovTitle.textContent = 'KICKBOXER'; ovTitle.style.color = '';
+  ovText.innerHTML = menuHTML;
+  ovBtn.textContent = 'FIGHT';
+  ov.classList.remove('hidden');
+}
+ovBtn.addEventListener('click', () => startMatch(false));
+ovPractice.addEventListener('click', () => startMatch(true));
 
 reset();
 requestAnimationFrame(frame);
